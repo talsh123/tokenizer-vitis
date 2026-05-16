@@ -1,0 +1,4 @@
+domain_path: C:\Users\talsh\Vitis\final_project_eth_nexys_video\platform\export\platform\sw\standalone_microblaze_0
+app_src_dir: C:\AMDDesignTools\2025.2\Vitis\data\embeddedsw\lib\sw_apps\lwip_echo_server
+template: lwip_echo_server
+lang: c
