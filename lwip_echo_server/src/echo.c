@@ -91,30 +91,27 @@ void print_app_header()
     xil_printf("Tokenizer HW base address: 0x%08X\n\r", TOK_BASE_ADDR);
 }
 
+/// ------------------------ MY CODE ------------------------
 err_t recv_callback(void *arg, struct tcp_pcb *tpcb,
                                struct pbuf *p, err_t err)
 {
     int i;
     u8 *payload;
-    char resp_buf[2048];  /* buffer for building the response string */
+    char resp_buf[2048];
     int resp_len = 0;
     int token_count = 0;
     u16 tid;
 
-    /* do not read the packet if we are not in ESTABLISHED state */
     if (!p) {
         tcp_close(tpcb);
         tcp_recv(tpcb, NULL);
         return ERR_OK;
     }
 
-    /* indicate that the packet has been received */
     tcp_recved(tpcb, p->len);
 
-    /* get pointer to the payload data */
     payload = (u8 *)p->payload;
 
-    /* Debug: print received text to UART */
     xil_printf("Received %d bytes: ", p->len);
     for (i = 0; i < p->len && i < 80; i++) {
         if (payload[i] >= 0x20 && payload[i] < 0x7F)
@@ -124,17 +121,19 @@ err_t recv_callback(void *arg, struct tcp_pcb *tpcb,
     }
     xil_printf("\n\r");
 
-    /* Send each byte to the tokenizer hardware */
+    /* Send each byte to the tokenizer hardware, skip \r and \n */
     for (i = 0; i < p->len; i++) {
-        tok_send_byte(payload[i]);
+        u8 c = payload[i];
+        if (c == '\r' || c == '\n')
+            continue;
+        tok_send_byte(c);
     }
 
-    /* Send a trailing space to flush the last word through the tokenizer */
+    /* Send a trailing space to flush the last word */
     tok_send_byte(' ');
 
-    /* Small delay to let the hardware pipeline finish processing.
-     * The tokenizer needs time for binary search + backtracking. */
-    for (volatile int d = 0; d < 5000; d++);
+    /* Let the hardware pipeline finish processing */
+    for (volatile int d = 0; d < 50000; d++);
 
     /* Read all available token IDs from the output FIFO */
     resp_len = 0;
@@ -144,19 +143,15 @@ err_t recv_callback(void *arg, struct tcp_pcb *tpcb,
         tid = tok_read_token();
         token_count++;
 
-        /* Format each token ID into the response buffer */
         resp_len += snprintf(resp_buf + resp_len, sizeof(resp_buf) - resp_len,
                              "%d ", tid);
 
-        /* Debug: print to UART */
         xil_printf("  Token[%d] = %d\n\r", token_count - 1, tid);
 
-        /* Safety: don't overflow response buffer */
         if (resp_len >= (int)sizeof(resp_buf) - 20)
             break;
     }
 
-    /* Add newline at end of token list */
     if (resp_len > 0) {
         resp_len += snprintf(resp_buf + resp_len, sizeof(resp_buf) - resp_len, "\r\n");
     } else {
@@ -165,18 +160,17 @@ err_t recv_callback(void *arg, struct tcp_pcb *tpcb,
 
     xil_printf("Total tokens: %d\n\r", token_count);
 
-    /* Send the token IDs back to the client over TCP */
     if (tcp_sndbuf(tpcb) > resp_len) {
         err = tcp_write(tpcb, resp_buf, resp_len, 1);
     } else {
         xil_printf("no space in tcp_sndbuf\n\r");
     }
 
-    /* free the received pbuf */
     pbuf_free(p);
 
     return ERR_OK;
 }
+/// ------------------------ END OF MY CODE ------------------------
 
 err_t accept_callback(void *arg, struct tcp_pcb *newpcb, err_t err)
 {
