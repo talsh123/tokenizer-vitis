@@ -396,6 +396,20 @@ void axieth_link_status(struct netif *netif, xaxiemacif_s *xemacs, XAxiEthernet 
 		// 	}
 		// 	break;
 		/// ------------------------ MY CODE ------------------------
+		/*
+		the commented code above is the previous boiler-plate code, below is the changes we've made
+		this file handles the ETH link detection and re-negotiation. the stock code has an ETH_LINK_NEGOTIATING case
+		that calls phy_setup_axiemac everytime the link goes down and comes back up.
+
+		the stock code calls phy_setup_axiemac every time the link renegotiates.
+		phy_setup_axiemac calls get_IEEE_phy_speed which does a full PHY auto-negotiation sequence.
+		on the RTL8211E (the PHY chip on the Nexys Video board), repeated auto-negotiation was unreliable — the link would sometimes negotiate at 10 Mbps or fail entirely on subsequent attempts.
+		the fix: only do full PHY setup on the first link-up (first_link = 1).
+		on any subsequent link-down/link-up events, skip the auto-negotiation and hardcode 100 Mbps.
+		the static int first_link persists across function calls, so after the first successful negotiation it's always 0.
+		this is pragmatic — not elegant. The root cause is that the RTL8211E's auto-negotiation behavior doesn't match what the Xilinx BSP expects.
+		A proper fix would implement the full RTL8211E register sequence, but hardcoding 100 Mbps on re-link works reliably for our project.
+		*/
 		case ETH_LINK_NEGOTIATING:
 			if (phy_link_status && phy_autoneg_status) {
 

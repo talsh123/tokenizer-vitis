@@ -29,6 +29,20 @@
  *
  */
 
+ /*
+ this file contains PHY-specific speed detection code.
+ the stock Xilinx BSP only knows about Marvell and TI PHYs.
+ the Nexys Video has a Realtek RTL8211E.
+ the stock get_IEEE_phy_speed function has this flow:
+ 1. detect PHY address
+ 2. read PHY identifier register
+ 3. if Marvell -> call Marvell-specific speed function
+ 4. if TI -> call TI-specific speed function
+ 5. otherwise -> print warning, fall through
+
+ our addition adds a third case after the TI check.
+ */
+
 #include "netif/xaxiemacif.h"
 #include "lwipopts.h"
 #include "sleep.h"
@@ -619,18 +633,26 @@ unsigned get_IEEE_phy_speed(XAxiEthernet *xaxiemacp)
 		}
 	}
 	/// ------------------------ MY CODE ------------------------
-	else if (phy_identifier == 0x001c) {
-		/* Realtek RTL8211E - read negotiated speed from register 0x1A (page 0) */
+	else if (phy_identifier == 0x001c) { // check for Realtek's IEEE OUI (Organizationally Unique Identifier)
 		u16 status;
 		u16 speed;
 
-		/* Read PHY Specific Status Register (0x1A) on page 0 */
+		// 0x1F is the page select register on the RTL8211E.
+		// writing 0x0000 selects page 0 (the default register page).
 		XAxiEthernet_PhyWrite(xaxiemacp, phy_addr, 0x1f, 0x0000);
+
+		// 0x1A on page 0 is the RTL8211E's PHY-Specific Status Register (PHYSR).
+		// this register contains the actual negotiated link speed after auto-negotiation completes.
 		XAxiEthernet_PhyRead(xaxiemacp, phy_addr, 0x1A, &status);
 
-		/* Bits [5:4] indicate speed: 00=10M, 01=100M, 10=1000M */
+		// bits [5:4] encode the negotiated speed:
+		// 00 = 10 Mbps
+		// 01 = 100 Mbps
+		// 10 = 1000 Mbps
+		// shifting right by 4 and masking with 0x03 extracts these two bits.
 		speed = (status >> 4) & 0x03;
 
+		// prints depending on the speed
 		if (speed == 2) {
 			xil_printf("RTL8211E: Negotiated speed 1000 Mbps\r\n");
 			return 1000;
