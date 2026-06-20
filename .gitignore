@@ -19,3 +19,8 @@
 
 _ide/logs
 _ide/.wsdata
+
+# Editor index caches, IDE session journals, and tool temp dirs (regenerated, noisy)
+**/.cache/
+_ide/workspace_journal*.py
+**/.Xil/
