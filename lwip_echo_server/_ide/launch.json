@@ -27,7 +27,7 @@
 					"plDevice": "Auto Detect",
 					"psDevice": "Auto Detect"
 				},
-				"bitstreamFile": "C:\\Users\\talsh\\Vitis\\final_project_eth_nexys_video\\lwip_echo_server\\_ide\\bitstream\\design_1_wrapper.bit",
+				"bitstreamFile": "C:\\Users\\talsh\\.Xilinx\\projects\\uart\\uart.runs\\impl_1\\design_1_wrapper.bit",
 				"downloadElf": [
 					{
 						"core": "microblaze_0",

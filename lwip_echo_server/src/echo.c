@@ -71,6 +71,14 @@ static inline int tok_has_token(void) {
     return Xil_In32(TOK_STATUS) & 0x2;
 }
 
+// this function reads the status register and checks bit 3 (pipeline_busy).
+// it returns non-zero while the tokenizer pipeline still has data in flight anywhere
+// (a byte/word being processed, or a token in flight to the output FIFO). this lets the
+// software drain exactly until the hardware is idle instead of waiting a fixed delay.
+static inline int tok_pipeline_busy(void) {
+    return Xil_In32(TOK_STATUS) & 0x8;
+}
+
 // this function polls STATUS until there's space, then writes one byte to TX_DATA
 // Xil_Out32 is a Xilinx helper that does a 32-bit-memory-mapped write - the upper 24 bits of the write are zeros - the verilog looks at s_axi_wdata[7:0]
 static void tok_send_byte(u8 byte) {
@@ -138,38 +146,56 @@ err_t recv_callback(void *arg, struct tcp_pcb *tpcb,
     // the timer counts upward from 0 continuously.
     u32 t_start = XTmrCtr_GetValue(&timer, 0);
 
-    // sends each text character to the tokenizer hardware, skipping carriage return and newline
-    // the trailing space is critical - it acts as a word boundary trigger.
-    // without it, the last word would never get a word_done signal and its tokens would stay stuck in the pipeline
+    // forward every received byte unchanged - nothing stripped, no synthetic boundary appended.
+    // the hardware pre-tokenizer already treats any non-alphanumeric byte (space, tab, CR, LF,
+    // punctuation) as a word boundary, so the real whitespace/newline in the text flushes each
+    // completed word - including the CR/LF that ends a telnet line, which flushes that line's
+    // last word. a word that ends exactly at a TCP segment edge now stays in the pipeline until
+    // the rest of it (and its real boundary) arrive in a later segment, so it tokenizes
+    // correctly instead of being cut at the packet edge.
+    //
+    // we also drain while sending: after each byte, pull any tokens already produced. this keeps
+    // the output FIFO from backing up on a long input, so a 256-deep FIFO suffices even for
+    // inputs that produce far more than 256 tokens. a token is always read when available so the
+    // pipeline can never stall waiting on us; we only stop *appending* to the response once the
+    // response buffer is nearly full (very long inputs get a truncated text reply but the
+    // hardware still drains fully).
     for (i = 0; i < p->len; i++) {
-        u8 c = payload[i];
-        if (c == '\r' || c == '\n')
-            continue;
-        tok_send_byte(c);
+        tok_send_byte(payload[i]);
+        while (tok_has_token()) {
+            tid = tok_read_token();
+            token_count++;
+            if (resp_len < (int)sizeof(resp_buf) - 12)
+                resp_len += snprintf(resp_buf + resp_len, sizeof(resp_buf) - resp_len, "%d ", tid);
+        }
     }
-    tok_send_byte(' ');
 
     // captures the timing after sending.
-    // t_send - t_start gives the send phase duration in timer ticks
+    // t_sent - t_start gives the send phase duration in timer ticks
     u32 t_sent = XTmrCtr_GetValue(&timer, 0);
 
-    // this is a busy-wait loop.
-    // this gives the tokenizer hardware time to finish processing the last word's backtracking and emit all tokens.
-    // the volatile keyword prevents the compiler from optimizing the loop away.
-    // 50,000 iterations at ~100MHz is roughly 500µs of delay.
-    // this is a known limitation - in a production design, we need to use an interrupt or a "pipeline done" status bit instead of a blind delay.
-    for (volatile int d = 0; d < 50000; d++);
+    // final drain - replaces the old fixed ~500us busy-wait with a deterministic wait that
+    // lasts exactly as long as the hardware needs, using STATUS bit 3 (pipeline_busy).
+    //
+    // whether we may wait for the pipeline to go fully idle depends on how this segment ended:
+    //  - last byte is a word boundary (the normal case - a telnet line ends in CR/LF): every word
+    //    in the segment flushes, so the pipeline WILL go idle. wait until pipeline_busy clears and
+    //    read every token.
+    //  - last byte is alphanumeric: a partial word is being held on purpose for the next segment,
+    //    so the pipeline will NOT go idle by itself. we must not wait on pipeline_busy here (that
+    //    would block lwIP forever); we just take the tokens already produced and return. the held
+    //    word's tokens are drained at the start of the next segment by the send loop above.
+    u8 last = (p->len > 0) ? payload[p->len - 1] : (u8)' ';
+    int ended_on_boundary =
+        !((last >= 'a' && last <= 'z') || (last >= 'A' && last <= 'Z') || (last >= '0' && last <= '9'));
 
-    // this drains all tokens from the output FIFO, formatting each as a decimal number followed by a space.
-    // the snprintf builds the response string incrementally.
-    // the buffer overflow check >= sizeof - 20 prevents writing past the end of resp_buf
-    while (tok_has_token()) {
-        tid = tok_read_token();
-        token_count++;
-        resp_len += snprintf(resp_buf + resp_len, sizeof(resp_buf) - resp_len,
-                             "%d ", tid);
-        if (resp_len >= (int)sizeof(resp_buf) - 20)
-            break;
+    while ((ended_on_boundary && tok_pipeline_busy()) || tok_has_token()) {
+        if (tok_has_token()) {
+            tid = tok_read_token();
+            token_count++;
+            if (resp_len < (int)sizeof(resp_buf) - 12)
+                resp_len += snprintf(resp_buf + resp_len, sizeof(resp_buf) - resp_len, "%d ", tid);
+        }
     }
 
     // captures the timing after getting the value back.
@@ -185,18 +211,22 @@ err_t recv_callback(void *arg, struct tcp_pcb *tpcb,
     xil_printf("Send: %u us | Total: %u us | Tokens: %d\n\r",
             send_us, total_us, token_count);
 
-    /* formats the response print */
+    /* response framing: append the line terminator only when this segment actually ended a
+       line (its last byte was a real word boundary). a segment that ended mid-word is part of
+       a line still being received, so we send its tokens WITHOUT a newline - the next segment's
+       tokens continue the same line. this keeps all of a typed line's tokens on one line even
+       when the client splits the text and the CR/LF into separate TCP segments. segments that
+       produced no tokens send nothing, so held-word segments don't emit blank lines. */
     if (resp_len > 0) {
-        resp_len += snprintf(resp_buf + resp_len, sizeof(resp_buf) - resp_len, "\r\n");
-    } else {
-        resp_len = snprintf(resp_buf, sizeof(resp_buf), "(no tokens)\r\n");
-    }
+        if (ended_on_boundary)
+            resp_len += snprintf(resp_buf + resp_len, sizeof(resp_buf) - resp_len, "\r\n");
 
-    // sends the tcp response
-    if (tcp_sndbuf(tpcb) > resp_len) {
-        err = tcp_write(tpcb, resp_buf, resp_len, 1);
-    } else {
-        xil_printf("no space in tcp_sndbuf\n\r");
+        // sends the tcp response
+        if (tcp_sndbuf(tpcb) > resp_len) {
+            err = tcp_write(tpcb, resp_buf, resp_len, 1);
+        } else {
+            xil_printf("no space in tcp_sndbuf\n\r");
+        }
     }
 
     // frees the lwIP packet buffer.
