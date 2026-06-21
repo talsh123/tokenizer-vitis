@@ -90,6 +90,20 @@ static int tokenizer_dma_init(void)
     return XST_SUCCESS;
 }
 
+// #7: recover the DMA after a transfer timeout. A stalled channel (e.g. a transfer that somehow
+// never sees TLAST) is left BUSY, which would wedge every later transfer and silently kill
+// tokenization until the next reboot. Resetting returns both channels to a known-idle state so the
+// server keeps serving. This is the hardware-side backstop to the has_word guard in recv_callback,
+// which already prevents the only known zero-token (no-TLAST) case from ever launching a DMA.
+static void tokenizer_dma_recover(void)
+{
+    u32 rt = 1000000u;
+    XAxiDma_Reset(&axi_dma);
+    while (!XAxiDma_ResetIsDone(&axi_dma) && --rt) { }
+    XAxiDma_IntrDisable(&axi_dma, XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DEVICE_TO_DMA);
+    XAxiDma_IntrDisable(&axi_dma, XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DMA_TO_DEVICE);
+}
+
 // tokenize `len` bytes already sitting in dma_in_buf. The input MUST end on a word boundary
 // (whitespace/CR/LF) so the final word flushes and the IP asserts m_axis TLAST on its last token --
 // otherwise the S2MM transfer never sees TLAST and the waits below would hang. Returns the number
@@ -113,16 +127,23 @@ static int tokenizer_dma_run(u32 len)
     // wait for the input to finish streaming in...
     timeout = 1000000u;
     while (XAxiDma_Busy(&axi_dma, XAXIDMA_DMA_TO_DEVICE) && --timeout) { }
-    if (timeout == 0u) { xil_printf("DMA: MM2S timeout\n\r"); return -1; }
+    if (timeout == 0u) { xil_printf("DMA: MM2S timeout -- resetting\n\r"); tokenizer_dma_recover(); return -1; }
 
     // ...then for every token to stream back (S2MM completes when the IP asserts TLAST). The caller
     // only launches a transfer when >=1 token is guaranteed, so a timeout here is a real fault.
     timeout = 1000000u;
     while (XAxiDma_Busy(&axi_dma, XAXIDMA_DEVICE_TO_DMA) && --timeout) { }
-    if (timeout == 0u) { xil_printf("DMA: S2MM timeout\n\r"); return -1; }
+    if (timeout == 0u) { xil_printf("DMA: S2MM timeout -- resetting\n\r"); tokenizer_dma_recover(); return -1; }
 
-    Xil_DCacheInvalidateRange((UINTPTR)dma_tok_buf, MAX_TOKENS * sizeof(u16));
-    return (int)(Xil_In32(TOK_COUNT_REG) & 0xFFFFu);  // the IP reports how many tokens it produced
+    // #8: the IP reports the token count via this MMIO register (not cached), so read it FIRST, then
+    // invalidate only the bytes the DMA actually wrote (ntok tokens x 2 B) instead of the whole 2 KB
+    // buffer -- a typical short response is a couple of cache lines rather than all 64.
+    {
+        int ntok = (int)(Xil_In32(TOK_COUNT_REG) & 0xFFFFu);  // the IP reports how many tokens it produced
+        if (ntok > 0)
+            Xil_DCacheInvalidateRange((UINTPTR)dma_tok_buf, (u32)ntok * sizeof(u16));
+        return ntok;
+    }
 }
 
 int transfer_data() {
