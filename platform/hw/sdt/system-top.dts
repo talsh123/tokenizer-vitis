@@ -41,6 +41,7 @@
 			      <0x41200000 &microblaze_0_axi_intc_0 0x41200000 0x10000>, 
 			      <0x41c00000 &axi_timer_0 0x41c00000 0x10000>, 
 			      <0x41e00000 &axi_ethernet_0_dma 0x41e00000 0x10000>, 
+			      <0x41e10000 &axi_dma_0 0x41e10000 0x10000>, 
 			      <0x44a00000 &tokenizer_axi_lite_0 0x44a00000 0x1000>;
 		#ranges-address-cells = <0x1>;
 		#ranges-size-cells = <0x1>;

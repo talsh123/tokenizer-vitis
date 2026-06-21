@@ -1,3 +1,6 @@
+axi_dma_0:
+- axi_dma
+- axidma
 axi_ethernet_0:
 - axi_ethernet
 - axiethernet

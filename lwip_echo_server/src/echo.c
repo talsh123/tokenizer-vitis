@@ -43,55 +43,86 @@ this echo.c file is modified to intercept incoming text, feed it through the tok
 #include "xil_io.h"
 
 /// ------------------------ MY CODE ------------------------
-// this brings the axi timer driver so you can measure tokenizer latency.
+// AXI timer driver -- measures tokenizer latency. Kept from the MMIO build so the DMA latency
+// numbers are directly comparable to the old byte-by-byte AXI-Lite numbers (same timer, same /100).
 #include "xtmrctr.h"
+// AXI DMA + cache drivers for the R2 DMA datapath (replaces the byte-by-byte AXI-Lite send/drain).
+#include "xaxidma.h"
+#include "xil_cache.h"
+#include "xparameters.h"
+
 // this timer variable is a global instance of the timer hardware driver.
 XTmrCtr timer;
 
-#define TOK_BASE_ADDR  0x44A00000 // TOK_BASE_ADDR maps to the register map in tokenizer_axi_lite.v - points to /tokenizer_axi_lite_0/s_axi address.
-// these offsets match the case(s_axi_araddr[3:2]) login in Verilog
-#define TOK_TX_DATA    (TOK_BASE_ADDR + 0x00) // this match 2'b00 = 0x00
-#define TOK_RX_DATA    (TOK_BASE_ADDR + 0x04) // this match 2'b01 = 0x04
-#define TOK_STATUS     (TOK_BASE_ADDR + 0x08) // this match 2'b10 = 0x08
-/// ------------------------ END OF MY CODE ------------------------
+#define TOK_BASE_ADDR  0x44A00000 // tokenizer_axi_lite.v register map -- /tokenizer_axi_lite_0/s_axi base.
+// AXI-Lite TOKEN_COUNT register (0x0C): write any value = clear, read = tokens produced since clear.
+// AXI DMA Simple-mode S2MM does not report a received length, so we read the count from the IP here.
+#define TOK_COUNT_REG  (TOK_BASE_ADDR + 0x0C)
 
-// this function reads the status register and checks bit 0.
-// basically takes the status register and ANDs it with 0x01.
-// it returns non-zero if the input FIFO has space.
-// Xil_In32 is a Xilinx helper that does a 32-bit-memory-mapped read - it compiles to a single lwi (load word immediate) instruction on MicroBlaze.
-static inline int tok_can_write(void) {
-    return Xil_In32(TOK_STATUS) & 0x1;
+// our AXI DMA base (xparameters.h: XPAR_AXI_DMA_0_BASEADDR = 0x41E10000). NOTE: there are TWO DMAs
+// in this design -- ours is 0x41E10000; the AXI Ethernet's own DMA (0x41E00000) is a DIFFERENT
+// instance, do not use it. This is the SDT flow, so LookupConfig takes the base address (no device id).
+#define TOK_DMA_BASEADDR  XPAR_AXI_DMA_0_BASEADDR
+
+#define MAX_INPUT_BYTES  2048u  // largest text chunk streamed in one DMA transfer
+#define MAX_TOKENS       1024u  // largest token response (each token = 2 bytes in DDR)
+
+// DMA buffers -- cache-line (64B) aligned, and they resolve to DDR: the .elf data sections live in
+// the MIG range (0x8000_0000..), which is the only window the AXI DMA can reach -- not local BRAM.
+static u8  dma_in_buf [MAX_INPUT_BYTES] __attribute__((aligned(64)));
+static u16 dma_tok_buf[MAX_TOKENS]      __attribute__((aligned(64)));
+
+static XAxiDma axi_dma;
+
+// one-time DMA bring-up; called from start_application(). returns XST_SUCCESS / XST_FAILURE.
+static int tokenizer_dma_init(void)
+{
+    XAxiDma_Config *cfg = XAxiDma_LookupConfig(TOK_DMA_BASEADDR);
+    if (cfg == NULL) { xil_printf("DMA: LookupConfig failed\n\r"); return XST_FAILURE; }
+    if (XAxiDma_CfgInitialize(&axi_dma, cfg) != XST_SUCCESS) {
+        xil_printf("DMA: CfgInitialize failed\n\r"); return XST_FAILURE;
+    }
+    if (XAxiDma_HasSg(&axi_dma)) {            // we built Simple mode -- Scatter-Gather must be off
+        xil_printf("DMA: unexpected Scatter-Gather mode\n\r"); return XST_FAILURE;
+    }
+    XAxiDma_IntrDisable(&axi_dma, XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DEVICE_TO_DMA);
+    XAxiDma_IntrDisable(&axi_dma, XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DMA_TO_DEVICE);
+    return XST_SUCCESS;
 }
 
-// this function reads the status register and checks bit 1.
-// basically takes the status register and ANDs it with 0x02.
-// it returns non-zero if the token is available in the output FIFO.
-// Xil_In32 is a Xilinx helper that does a 32-bit-memory-mapped read - it compiles to a single lwi (load word immediate) instruction on MicroBlaze.
-static inline int tok_has_token(void) {
-    return Xil_In32(TOK_STATUS) & 0x2;
-}
+// tokenize `len` bytes already sitting in dma_in_buf. The input MUST end on a word boundary
+// (whitespace/CR/LF) so the final word flushes and the IP asserts m_axis TLAST on its last token --
+// otherwise the S2MM transfer never sees TLAST and the waits below would hang. Returns the number
+// of tokens (now in dma_tok_buf), or -1 on error/timeout.
+static int tokenizer_dma_run(u32 len)
+{
+    u32 timeout;
+    if (len == 0u || len > MAX_INPUT_BYTES) return -1;
 
-// this function reads the status register and checks bit 3 (pipeline_busy).
-// it returns non-zero while the tokenizer pipeline still has data in flight anywhere
-// (a byte/word being processed, or a token in flight to the output FIFO). this lets the
-// software drain exactly until the hardware is idle instead of waiting a fixed delay.
-static inline int tok_pipeline_busy(void) {
-    return Xil_In32(TOK_STATUS) & 0x8;
-}
+    Xil_Out32(TOK_COUNT_REG, 0u);            // clear the IP's token counter for this transfer
 
-// this function polls STATUS until there's space, then writes one byte to TX_DATA
-// Xil_Out32 is a Xilinx helper that does a 32-bit-memory-mapped write - the upper 24 bits of the write are zeros - the verilog looks at s_axi_wdata[7:0]
-static void tok_send_byte(u8 byte) {
-    while (!tok_can_write());  /* wait for space in input FIFO */
-    Xil_Out32(TOK_TX_DATA, (u32)byte);
-}
+    Xil_DCacheFlushRange((UINTPTR)dma_in_buf, len);
+    Xil_DCacheInvalidateRange((UINTPTR)dma_tok_buf, MAX_TOKENS * sizeof(u16));
 
-// this function polls STATUS until a token is available, then reads RX_DATA.
-// the Verilog returns 16-bit token ID zero-extended to 32 bit, so casting to u16 is safe.
-// Xil_In32 is a Xilinx helper that does a 32-bit-memory-mapped read - it compiles to a single lwi (load word immediate) instruction on MicroBlaze.
-static u16 tok_read_token(void) {
-    while (!tok_has_token());  /* wait for token in output FIFO */
-    return (u16)Xil_In32(TOK_RX_DATA);
+    // arm the receive (S2MM) FIRST so it's ready before any token is produced, then kick MM2S.
+    if (XAxiDma_SimpleTransfer(&axi_dma, (UINTPTR)dma_tok_buf,
+            MAX_TOKENS * sizeof(u16), XAXIDMA_DEVICE_TO_DMA) != XST_SUCCESS) return -1;
+    if (XAxiDma_SimpleTransfer(&axi_dma, (UINTPTR)dma_in_buf,
+            len, XAXIDMA_DMA_TO_DEVICE) != XST_SUCCESS) return -1;
+
+    // wait for the input to finish streaming in...
+    timeout = 1000000u;
+    while (XAxiDma_Busy(&axi_dma, XAXIDMA_DMA_TO_DEVICE) && --timeout) { }
+    if (timeout == 0u) { xil_printf("DMA: MM2S timeout\n\r"); return -1; }
+
+    // ...then for every token to stream back (S2MM completes when the IP asserts TLAST). The caller
+    // only launches a transfer when >=1 token is guaranteed, so a timeout here is a real fault.
+    timeout = 1000000u;
+    while (XAxiDma_Busy(&axi_dma, XAXIDMA_DEVICE_TO_DMA) && --timeout) { }
+    if (timeout == 0u) { xil_printf("DMA: S2MM timeout\n\r"); return -1; }
+
+    Xil_DCacheInvalidateRange((UINTPTR)dma_tok_buf, MAX_TOKENS * sizeof(u16));
+    return (int)(Xil_In32(TOK_COUNT_REG) & 0xFFFFu);  // the IP reports how many tokens it produced
 }
 
 int transfer_data() {
@@ -110,8 +141,18 @@ void print_app_header()
 }
 
 /// ------------------------ MY CODE ------------------------
-// we removed the template recv_callback and replaced it.
-
+// we removed the template recv_callback and replaced it. This version streams the received text
+// through the tokenizer over AXI DMA (optimization R2) instead of byte-by-byte AXI-Lite MMIO: the
+// CPU just hands DDR buffers to the DMA and waits, so the ~140 us/token software tax of the old
+// poll-write-poll-read loop is gone.
+//
+// NOTE on cross-segment word reassembly: the previous MMIO version held a word that ended exactly
+// on a TCP segment edge in the pipeline until the rest arrived (the M3 fix). This DMA version
+// treats each segment as self-contained -- if a segment does not already end on a word boundary it
+// appends a newline so the last word flushes and S2MM sees TLAST. For telnet / line-buffered input
+// (each line, including its CR/LF, arrives in one segment) the result is identical; only a word
+// deliberately split across two TCP segments would tokenize differently. Cross-segment reassembly
+// can be re-added later by buffering received bytes until a boundary before launching the DMA.
 err_t recv_callback(void *arg, struct tcp_pcb *tpcb,
                                struct pbuf *p, err_t err)
 {
@@ -119,8 +160,8 @@ err_t recv_callback(void *arg, struct tcp_pcb *tpcb,
     u8 *payload;
     char resp_buf[2048];
     int resp_len = 0;
-    int token_count = 0;
-    u16 tid;
+    int ntok;
+    u32 len;
 
     if (!p) {
         tcp_close(tpcb);
@@ -128,100 +169,78 @@ err_t recv_callback(void *arg, struct tcp_pcb *tpcb,
         return ERR_OK;
     }
 
-    // tcp_recved tell lwIP we've consumed p->len bytes from the TCP receive window.
-    // this is critical - without it, lwIP would eventually stop accepting data because it thinks its receive buffer is full.
-    // p->payload points to the raw TCP data bytes.
+    // tcp_recved tells lwIP we've consumed p->len bytes from the TCP receive window. without it,
+    // lwIP would eventually stop accepting data because it thinks its receive buffer is full.
     tcp_recved(tpcb, p->len);
     payload = (u8 *)p->payload;
 
-    // this counts the actual text characters, excluding telnet line endings "\r\n".
-    // this is for the debug output only.
-    int text_bytes = 0;
-    for (i = 0; i < p->len; i++) {
-        if (payload[i] != '\r' && payload[i] != '\n')
-            text_bytes++;
+    // copy the segment into the DDR DMA input buffer (truncate if it somehow exceeds the buffer).
+    len = (p->len > MAX_INPUT_BYTES) ? MAX_INPUT_BYTES : (u32)p->len;
+    memcpy(dma_in_buf, payload, len);
+
+    // scan the segment: count text chars (debug) AND detect whether it contains any WORD character.
+    // this is critical: a segment with NO word char (a lone "\r\n", spaces, etc.) cannot produce a
+    // token, and because m_axis_tlast rides on a token, the IP would never assert TLAST -> the S2MM
+    // transfer would hang for the whole timeout, stalling lwIP and aborting the connection. So we
+    // must NOT launch the DMA on boundary-only input.
+    int text_bytes = 0, has_word = 0, has_nl = 0;
+    for (i = 0; i < (int)len; i++) {
+        u8 c = dma_in_buf[i];
+        if (c == '\r' || c == '\n') has_nl = 1; else text_bytes++;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) has_word = 1;
     }
 
-    // this captures the timer value before sending.
-    // the timer counts upward from 0 continuously.
-    u32 t_start = XTmrCtr_GetValue(&timer, 0);
-
-    // forward every received byte unchanged - nothing stripped, no synthetic boundary appended.
-    // the hardware pre-tokenizer already treats any non-alphanumeric byte (space, tab, CR, LF,
-    // punctuation) as a word boundary, so the real whitespace/newline in the text flushes each
-    // completed word - including the CR/LF that ends a telnet line, which flushes that line's
-    // last word. a word that ends exactly at a TCP segment edge now stays in the pipeline until
-    // the rest of it (and its real boundary) arrive in a later segment, so it tokenizes
-    // correctly instead of being cut at the packet edge.
-    //
-    // we also drain while sending: after each byte, pull any tokens already produced. this keeps
-    // the output FIFO from backing up on a long input, so a 256-deep FIFO suffices even for
-    // inputs that produce far more than 256 tokens. a token is always read when available so the
-    // pipeline can never stall waiting on us; we only stop *appending* to the response once the
-    // response buffer is nearly full (very long inputs get a truncated text reply but the
-    // hardware still drains fully).
-    for (i = 0; i < p->len; i++) {
-        tok_send_byte(payload[i]);
-        while (tok_has_token()) {
-            tid = tok_read_token();
-            token_count++;
-            if (resp_len < (int)sizeof(resp_buf) - 12)
-                resp_len += snprintf(resp_buf + resp_len, sizeof(resp_buf) - resp_len, "%d ", tid);
-        }
+    // boundary-only segment: telnet sends a word and its trailing CR/LF as separate TCP segments, so
+    // this is the "\r\n" that follows a word. Nothing to tokenize -- skip the DMA. If it carried a
+    // line ending, emit a CR/LF so the preceding segment's tokens get terminated on their own line.
+    if (!has_word) {
+        if (has_nl && (int)tcp_sndbuf(tpcb) >= 2)
+            tcp_write(tpcb, "\r\n", 2, 1);
+        xil_printf("Received %d bytes (boundary-only, skipped)\n\r", p->len);
+        pbuf_free(p);
+        return ERR_OK;
     }
 
-    // captures the timing after sending.
-    // t_sent - t_start gives the send phase duration in timer ticks
-    u32 t_sent = XTmrCtr_GetValue(&timer, 0);
-
-    // final drain - replaces the old fixed ~500us busy-wait with a deterministic wait that
-    // lasts exactly as long as the hardware needs, using STATUS bit 3 (pipeline_busy).
-    //
-    // whether we may wait for the pipeline to go fully idle depends on how this segment ended:
-    //  - last byte is a word boundary (the normal case - a telnet line ends in CR/LF): every word
-    //    in the segment flushes, so the pipeline WILL go idle. wait until pipeline_busy clears and
-    //    read every token.
-    //  - last byte is alphanumeric: a partial word is being held on purpose for the next segment,
-    //    so the pipeline will NOT go idle by itself. we must not wait on pipeline_busy here (that
-    //    would block lwIP forever); we just take the tokens already produced and return. the held
-    //    word's tokens are drained at the start of the next segment by the send loop above.
-    u8 last = (p->len > 0) ? payload[p->len - 1] : (u8)' ';
+    // did this segment end on a real word boundary? (used for the response line framing below)
+    u8 last = dma_in_buf[len - 1];
     int ended_on_boundary =
         !((last >= 'a' && last <= 'z') || (last >= 'A' && last <= 'Z') || (last >= '0' && last <= '9'));
 
-    while ((ended_on_boundary && tok_pipeline_busy()) || tok_has_token()) {
-        if (tok_has_token()) {
-            tid = tok_read_token();
-            token_count++;
-            if (resp_len < (int)sizeof(resp_buf) - 12)
-                resp_len += snprintf(resp_buf + resp_len, sizeof(resp_buf) - resp_len, "%d ", tid);
-        }
-    }
+    // the segment has >=1 word char, so it WILL produce >=1 token (and thus TLAST). If it didn't
+    // already end on a boundary, append a newline so the final word flushes.
+    if (!ended_on_boundary && len < MAX_INPUT_BYTES)
+        dma_in_buf[len++] = (u8)'\n';
 
-    // captures the timing after getting the value back.
+    // time the whole DMA tokenization with the same 100 MHz timer the MMIO build used, so the
+    // before/after numbers are apples-to-apples. ticks are 10ns; /100 converts to microseconds.
+    u32 t_start = XTmrCtr_GetValue(&timer, 0);
+    ntok = tokenizer_dma_run(len);
     u32 t_end = XTmrCtr_GetValue(&timer, 0);
 
-    // calculates the timing in µs.
-    // division by 100 converts from 100MHz timer ticks (10ns each) to µs (1µs = 100 ticks).
-    // these prints to UART for debugging.
-    xil_printf("Received %d bytes (%d text)\n\r", p->len, text_bytes);
-    xil_printf("Total tokens: %d\n\r", token_count);
-    u32 send_us = (t_sent - t_start) / 100;
-    u32 total_us = (t_end - t_start) / 100;
-    xil_printf("Send: %u us | Total: %u us | Tokens: %d\n\r",
-            send_us, total_us, token_count);
+    if (ntok > 0) {
+        for (i = 0; i < ntok; i++)
+            if (resp_len < (int)sizeof(resp_buf) - 12)
+                resp_len += snprintf(resp_buf + resp_len, sizeof(resp_buf) - resp_len,
+                                     "%d ", (u16)dma_tok_buf[i]);
+    }
 
-    /* response framing: append the line terminator only when this segment actually ended a
-       line (its last byte was a real word boundary). a segment that ended mid-word is part of
-       a line still being received, so we send its tokens WITHOUT a newline - the next segment's
-       tokens continue the same line. this keeps all of a typed line's tokens on one line even
-       when the client splits the text and the CR/LF into separate TCP segments. segments that
-       produced no tokens send nothing, so held-word segments don't emit blank lines. */
+    xil_printf("Received %d bytes (%d text)\n\r", p->len, text_bytes);
+    if (ntok < 0) {
+        xil_printf("DMA tokenize FAILED\n\r");
+    } else {
+        u32 total_us = (t_end - t_start) / 100;
+        xil_printf("Total tokens: %d\n\r", ntok);
+        xil_printf("DMA total: %u us | Tokens: %d\n\r", total_us, ntok);
+    }
+
+    /* response framing: append the line terminator only when this segment actually ended a line
+       (its last byte was a real word boundary), matching the MMIO build. a segment that ended
+       mid-word sends its tokens WITHOUT a newline so the next segment's tokens continue the same
+       line; segments that produced no tokens send nothing. */
     if (resp_len > 0) {
         if (ended_on_boundary)
             resp_len += snprintf(resp_buf + resp_len, sizeof(resp_buf) - resp_len, "\r\n");
 
-        // sends the tcp response
         if (tcp_sndbuf(tpcb) > resp_len) {
             err = tcp_write(tpcb, resp_buf, resp_len, 1);
         } else {
@@ -229,8 +248,7 @@ err_t recv_callback(void *arg, struct tcp_pcb *tpcb,
         }
     }
 
-    // frees the lwIP packet buffer.
-    // without this, you'd leak memory and eventually run out of pbufs.
+    // frees the lwIP packet buffer -- without this you'd leak pbufs and eventually run out.
     pbuf_free(p);
     return ERR_OK;
 }
@@ -262,7 +280,12 @@ int start_application()
     XTmrCtr_Start(&timer, 0); // starts the timer
     // the timer runs at 100 MHz (same as clk_100), so each tick is 10ns.
     // XPAR_AXI_TIMER_0_BASEADDR is auto-generated to be 0x41C00000 which maps to /axi_timer_0/S_AXI in the Address Editor in Vivado.
-    /// ------------------------ END OF MY CODE ------------------------    
+
+    // bring up the AXI DMA used to stream text in / tokens out (optimization R2). if this fails the
+    // tokenizer can't run, so make the failure loud rather than hanging later inside recv_callback.
+    if (tokenizer_dma_init() != XST_SUCCESS)
+        xil_printf("WARNING: tokenizer DMA init failed -- tokenization will not work\n\r");
+    /// ------------------------ END OF MY CODE ------------------------
     
     struct tcp_pcb *pcb;
     err_t err;
