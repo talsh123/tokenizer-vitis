@@ -23,7 +23,7 @@ if (-not $netif) { Write-Error "Could not find the lwIP BSP netif dir under $pla
 Write-Host "BSP netif: $($netif.FullName)"
 
 foreach ($f in $files) {
-    $src = Join-Path $here $f
+    $src = Join-Path $here "$f.golden"   # canonical copies are *.golden so they are never compiled into the app
     $dst = Join-Path $netif.FullName $f
     if (-not (Test-Path $src)) { Write-Error "Missing canonical copy: $src"; exit 1 }
     if (Test-Path $dst) { Copy-Item $dst "$dst.stock_bak" -Force }   # keep what Vitis just generated

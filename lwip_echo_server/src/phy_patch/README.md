@@ -15,8 +15,13 @@ patches — after which the board gets **no Ethernet link**. (They are lwIP-port
 *independent*, they only change with the lwIP version, not with the design.)
 
 ## The durable fix (this folder)
-The patched files are kept here as the canonical, version-controlled copies. After any BSP regen /
-`.xsa` re-read, restore them with **one command** — no manual re-editing:
+The patched files are kept here as canonical, version-controlled copies named **`*.c.golden`**. The
+`.golden` extension is deliberate: it stops the Vitis IDE from auto-adding them to the build
+(`UserConfig.cmake`'s `USER_COMPILE_SOURCES`) — if they were compiled as `.c`, the app would hit
+**duplicate-symbol link errors** with the BSP's lwIP lib. They are *reference* files, copied into the
+BSP by the script, never compiled directly.
+
+After any BSP regen / `.xsa` re-read, restore them with **one command** — no manual re-editing:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File apply_phy_patch.ps1
