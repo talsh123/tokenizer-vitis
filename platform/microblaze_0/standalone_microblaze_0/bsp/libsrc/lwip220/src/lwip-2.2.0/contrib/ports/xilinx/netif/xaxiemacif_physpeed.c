@@ -29,20 +29,6 @@
  *
  */
 
- /*
- this file contains PHY-specific speed detection code.
- the stock Xilinx BSP only knows about Marvell and TI PHYs.
- the Nexys Video has a Realtek RTL8211E.
- the stock get_IEEE_phy_speed function has this flow:
- 1. detect PHY address
- 2. read PHY identifier register
- 3. if Marvell -> call Marvell-specific speed function
- 4. if TI -> call TI-specific speed function
- 5. otherwise -> print warning, fall through
-
- our addition adds a third case after the TI check.
- */
-
 #include "netif/xaxiemacif.h"
 #include "lwipopts.h"
 #include "sleep.h"

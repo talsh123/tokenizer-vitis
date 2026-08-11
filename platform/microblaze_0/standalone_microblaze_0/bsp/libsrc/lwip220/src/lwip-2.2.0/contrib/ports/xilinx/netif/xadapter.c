@@ -395,7 +395,7 @@ void axieth_link_status(struct netif *netif, xaxiemacif_s *xemacs, XAxiEthernet 
 		// 		xil_printf("Ethernet Link up\r\n");
 		// 	}
 		// 	break;
-		/// ------------------------ MY CODE ------------------------
+				/// ------------------------ MY CODE ------------------------
 		/*
 		the commented code above is the previous boiler-plate code, below is the changes we've made
 		this file handles the ETH link detection and re-negotiation. the stock code has an ETH_LINK_NEGOTIATING case

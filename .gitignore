@@ -1,26 +1,54 @@
-# Ignore build output directory
+# ============================================================
+#  tokenizer-vitis — MicroBlaze firmware (Vitis 2025.2)
+# ============================================================
+# Only source is tracked: the app (lwip_echo_server/src), the BSP driver
+# sources + PHY patches, the platform config, and the exported hardware (.xsa).
+# The compiled BSP, bitstreams, and CMake/Ninja build trees are regenerated
+# by the Vitis "Build" action and are intentionally NOT tracked.
+
+# ---- Build trees ----
 /build
 /export
+**/build_configs/gen_bsp/
+**/bsp/lib/
+**/.cache/
+**/.Xil/
 
-# Ignore object files and dependent files
-.o
-.d
+# ---- Compiled artifacts ----
+*.o
+*.obj
+*.d
+*.a
+*.elf
+*.bit
+*.mmi
+*.pdi
+*.bin
+*.lo
+*.so
 
-#Ignore logs folder and log files
-/logs
-.log
+# ---- CMake / Ninja build state ----
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/*.ninja
+**/.ninja_deps
+**/.ninja_log
+**/CMakeOutput.log
+**/CMakeError.log
 
-#Ignore lock files
-.lock
-
-.bin
-.pdi
-.vitisWorkspace.json
-
+# ---- IDE session state ----
 _ide/logs
 _ide/.wsdata
-
-# Editor index caches, IDE session journals, and tool temp dirs (regenerated, noisy)
-**/.cache/
+_ide/version.ini
 _ide/workspace_journal*.py
-**/.Xil/
+**/_ide/bitstream/
+.vitisWorkspace.json
+
+# ---- Logs / locks / OS junk ----
+/logs
+*.log
+*.lock
+Thumbs.db
+.DS_Store
+desktop.ini
